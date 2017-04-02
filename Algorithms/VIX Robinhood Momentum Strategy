@@ -1,0 +1,204 @@
+import pandas
+import pandas as pd
+import datetime
+import numpy as np
+import talib
+from scipy import stats
+from quantopian.algorithm import attach_pipeline, pipeline_output
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import CustomFactor, Latest, SimpleMovingAverage
+from quantopian.pipeline.data.quandl import cboe_vix, cboe_vxv, cboe_vxd, cboe_vvix
+from quantopian.pipeline.data.quandl import yahoo_index_vix
+
+class GetVIX(CustomFactor):
+    window_length = 1
+    def compute(self, today, assets, out, vix):
+        out[:] = vix[-1]
+        
+def initialize(context):
+    #set_commission(commission.PerShare(cost=0.01, min_trade_cost=1.50))
+    set_slippage(slippage.VolumeShareSlippage(volume_limit=.20, price_impact=0.0))
+    #set_slippage(slippage.FixedSlippage(spread=0.00))
+    set_commission(commission.PerTrade(cost=0.00))
+    #set_slippage(slippage.FixedSlippage(spread=0.00))
+    
+    '''
+    context.SetAsideStocks = symbols(
+        'DWAS'
+        ,'SVXY'
+    )
+    '''
+    context.StayUnder1            = 0.03 # might have to use 0.05
+    context.SetAsideLeverageTotal = 0.50 - context.StayUnder1
+    context.XIV_BuyLeverage       = 1 - context.StayUnder1 - context.SetAsideLeverageTotal
+    context.UVXY_BuyLeverage      = 0.50 * context.XIV_BuyLeverage
+    context.NotUVXY_BuyLeverage   = context.XIV_BuyLeverage - context.UVXY_BuyLeverage
+
+    # long on short Medium-term VIX, a bit of a hedge
+    context.SetAsideStocks = symbols('ZIV')
+    # set up XIV
+    context.XIV     = symbol('XIV')
+    context.UVXY    = symbol('UVXY') # approx 8% weekly erosion, bigger spikes
+    #context.UVXY    = symbol('XVZ') # less erosion, smaller spikes
+    context.NotUVXY = symbol('XVZ') # less erosion, smaller spikes
+    #context.NotUVXY = symbol('BRK.B') # be sure is different from SetAsideStocks
+    context.VIXstocks = (context.XIV, context.UVXY, context.NotUVXY)
+
+    # only using the pipe for VIX currently
+    The_Pipe = Pipeline()
+    attach_pipeline(The_Pipe, 'The_Pipeline')
+    #get VIX at market open
+    The_Pipe.add(GetVIX(inputs=[cboe_vix.vix_close]), 'VixOpen')
+
+    schedule_function(Rebalance, date_rules.every_day(),
+        time_rules.market_open(minutes = 1)
+    )
+    schedule_function(Rebalance, date_rules.every_day(),
+        time_rules.market_close(minutes = 5)
+    )
+
+    schedule_function(RecordVars, date_rules.every_day(),
+        time_rules.market_close()
+    )
+        
+    context.LongVIX  = False
+    context.ShortVIX = False
+    context.SetAsideStocksAdjusted = False
+    context.VIXstocksAdjusted = False
+
+def before_trading_start(context, data):
+
+    # The Pipeline Output
+    The_Output       = pipeline_output('The_Pipeline')
+    context.VIXprice = The_Output["VixOpen"].iloc[0] # VIX at market open
+
+def RecordVars(context, data):
+
+    record(Leverage=context.account.leverage)
+
+def Rebalance(context, data):
+
+    VIXprice     = context.VIXprice # at market open
+    XIVprice     = data.current(context.XIV, 'price') 
+    XIV30        = data.history(context.XIV, "price", 30, "1d") 
+    XIV30Avg     = XIV30.mean()
+    UVXYprice    = data.current(context.UVXY, 'price')
+    VIX_Lev      = VIXlev(context, data)
+    Not_VIX_Lev  = NotVIXlev(context, data)
+    XIV30AvgPlus = XIV30Avg + 2.7
+
+    if not context.LongVIX and not context.ShortVIX:
+        context.LongVIX  = False
+        context.ShortVIX = True
+
+    elif (
+        XIVprice > 1.30 * XIV30Avg
+        and
+        (12.40 < VIXprice < 19.50)
+    ):
+        context.LongVIX  = False
+        context.ShortVIX = True
+
+    elif VIXprice <= 12.40 and XIVprice < XIV30AvgPlus:
+        context.LongVIX  = True
+        context.ShortVIX = False
+
+    elif VIXprice >= 19.50:
+        context.LongVIX  = False
+        context.ShortVIX = True
+
+    record(XIVavg = XIV30AvgPlus)
+    record(VIX    = VIXprice)
+    record(XIV    = XIVprice)
+    record(UVXY   = UVXYprice)
+
+    for stock in context.portfolio.positions:
+        if stock not in context.VIXstocks and stock not in context.SetAsideStocks:
+            order_target_percent(stock, 0.00)
+
+    if context.ShortVIX:
+        order_target_percent(context.UVXY, 0.00)
+        order_target_percent(context.NotUVXY, 0.00)
+        TarPer(context, data, context.XIV, context.XIV_BuyLeverage)
+
+    elif context.LongVIX:
+        order_target_percent(context.XIV, 0.00)
+        TarPer(context, data, context.UVXY, context.UVXY_BuyLeverage)
+        TarPer(context, data, context.NotUVXY, context.NotUVXY_BuyLeverage)
+
+    SetAsideStocks = context.SetAsideStocks
+    SetAsideLeveragePositions = len(SetAsideStocks)
+    for stock in SetAsideStocks:
+        if not DataCanTrade(context, data, stock):
+            SetAsideStocks.remove(stock)
+            SetAsideLeveragePositions -= 1
+    if context.SetAsideLeverageTotal < 1 - context.StayUnder1 - VIX_Lev:
+        SetAsideLeverageTotal = context.SetAsideLeverageTotal
+    else:
+        SetAsideLeverageTotal = 1 - context.StayUnder1 - VIX_Lev
+    SetAsideLeverage = float(SetAsideLeverageTotal / SetAsideLeveragePositions) if 0 < SetAsideLeveragePositions else 0.00
+    for stock in SetAsideStocks:
+        TarPer(context, data, stock, SetAsideLeverage)
+        
+def TarPer(context, data, stock, TargetPercent):
+
+    if DataCanTrade(context, data, stock):
+
+        amount = context.portfolio.positions[stock].amount
+        price = data.current(stock, 'price')
+        PosValue = float(amount * price)
+        NowLev = float(PosValue / context.portfolio.portfolio_value)
+        LevAdjust = TargetPercent - NowLev
+        LevAdjustMax = 1 - context.StayUnder1 - context.account.leverage
+        LevAdjust = LevAdjustMax if 0 < LevAdjustMax < LevAdjust else LevAdjust
+        LevAdjust = 0 if 0 > LevAdjust and 0 < amount else LevAdjust
+        if LevOK(context, data, stock):
+            order_percent(stock, LevAdjust)
+
+def VIXlev(context, data):
+
+    VIX_Lev = 0
+    for stock in context.VIXstocks:
+        amount = context.portfolio.positions[stock].amount
+        price = data.current(stock, 'price')
+        PosValue = float(amount * price)
+        VIX_Lev += float(PosValue / context.portfolio.portfolio_value)
+    return VIX_Lev
+
+def NotVIXlev(context, data):
+
+    VIX_Lev = VIXlev(context, data)
+    Not_VIX_Lev = context.account.leverage - VIX_Lev
+    return Not_VIX_Lev
+
+def LevOK(context, data, stock):
+
+    VIX_Lev        = VIXlev(context, data)
+    Not_VIX_Lev    = context.account.leverage - VIX_Lev
+    TotalLev       = VIX_Lev + Not_VIX_Lev
+    TotalLevOK     = True if 1 - context.StayUnder1 >= VIX_Lev + Not_VIX_Lev else False
+    VIX_Adjust     = True if VIX_Lev < context.XIV_BuyLeverage and Not_VIX_Lev > 0.975 * context.SetAsideLeverageTotal else False
+    VIX_TooHigh    = True if VIX_Lev > context.XIV_BuyLeverage else False
+    NotVIX_Adjust  = True if Not_VIX_Lev < context.SetAsideLeverageTotal and VIX_Lev > 0.975 * context.XIV_BuyLeverage else False
+    NotVIX_TooHigh = True if Not_VIX_Lev > context.SetAsideLeverageTotal else False
+    if stock in context.VIXstocks and not NotVIX_TooHigh and not get_open_orders():
+        return True
+    elif stock in context.SetAsideStocks and not VIX_TooHigh and not get_open_orders():
+        return True
+    elif stock in context.VIXstocks and VIX_Adjust and TotalLevOK:
+        return True
+    elif stock in context.SetAsideStocks and NotVIX_Adjust and TotalLevOK:
+        return True
+    else:
+        return False
+
+def DataCanTrade(context, data, stock):
+
+    try:
+        if data.can_trade(stock):
+            return True
+        else:
+            return False
+    except:
+        return False
